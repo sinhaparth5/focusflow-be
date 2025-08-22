@@ -113,12 +113,8 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
 		return
 	}
 
-	// Get the correct base URL for API calls
-	scheme := "https"
-	if c.Request.TLS == nil {
-		scheme = "http"
-	}
-	apiBase := fmt.Sprintf("%s://%s", scheme, c.Request.Host)
+	// Railway always serves over HTTPS, so force HTTPS for API calls
+	apiBase := fmt.Sprintf("https://%s", c.Request.Host)
 
 	// Return success page with token
 	successHTML := fmt.Sprintf(`
