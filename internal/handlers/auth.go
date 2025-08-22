@@ -8,8 +8,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"focusflow-backend/internal/models"
-	"focusflow-backend/internal/services"
+	"focusflow-be/internal/models"
+	"focusflow-be/internal/services"
 )
 
 type AuthHandler struct {
