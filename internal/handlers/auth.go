@@ -8,8 +8,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"focusflow-be/internal/models"
-	"focusflow-be/internal/services"
+	"focusflow-backend/internal/models"
+	"focusflow-backend/internal/services"
 )
 
 type AuthHandler struct {
@@ -113,6 +113,13 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
 		return
 	}
 
+	// Get the correct base URL for API calls
+	scheme := "https"
+	if c.Request.TLS == nil {
+		scheme = "http"
+	}
+	apiBase := fmt.Sprintf("%s://%s", scheme, c.Request.Host)
+
 	// Return success page with token
 	successHTML := fmt.Sprintf(`
 <!DOCTYPE html>
@@ -125,6 +132,8 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
         .token { background: #f8f9fa; border: 1px solid #dee2e6; padding: 10px; margin: 10px 0; word-break: break-all; font-family: monospace; font-size: 12px; }
         button { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; margin: 5px; }
         .test-section { background: #e7f3ff; border: 1px solid #b8daff; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        pre { background: #f8f9fa; padding: 10px; border-radius: 3px; overflow-x: auto; }
+        #test-results { margin-top: 10px; }
     </style>
 </head>
 <body>
@@ -139,7 +148,7 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
         
         <div class="test-section">
             <h4>Quick API Test:</h4>
-            <p>You can test the API immediately:</p>
+            <p>API Base URL: <code>%s</code></p>
             <button onclick="testMe()">Test /auth/me</button>
             <button onclick="testTasks()">Test /tasks</button>
             <div id="test-results"></div>
@@ -149,14 +158,20 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
         <p>Use this token in your API requests:</p>
         <pre>Authorization: Bearer %s</pre>
         
-        <p>Example curl command:</p>
+        <p>Example curl commands:</p>
         <pre>curl -H "Authorization: Bearer %s" \\
-     %s/auth/me</pre>
+     %s/auth/me
+
+curl -H "Authorization: Bearer %s" \\
+     %s/tasks</pre>
     </div>
     
     <script>
         const token = '%s';
         const apiBase = '%s';
+        
+        console.log('API Base URL:', apiBase);
+        console.log('Token:', token.substring(0, 20) + '...');
         
         function copyToken() {
             navigator.clipboard.writeText(token).then(() => {
@@ -166,13 +181,18 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
         
         async function testMe() {
             try {
+                console.log('Testing:', apiBase + '/auth/me');
                 const response = await fetch(apiBase + '/auth/me', {
-                    headers: { 'Authorization': 'Bearer ' + token }
+                    headers: { 
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }
                 });
                 const data = await response.json();
                 document.getElementById('test-results').innerHTML = 
-                    '<h5>/auth/me Result:</h5><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                    '<h5>/auth/me Result (' + response.status + '):</h5><pre>' + JSON.stringify(data, null, 2) + '</pre>';
             } catch (error) {
+                console.error('Test error:', error);
                 document.getElementById('test-results').innerHTML = 
                     '<h5>Error:</h5><pre>' + error.message + '</pre>';
             }
@@ -180,13 +200,18 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
         
         async function testTasks() {
             try {
+                console.log('Testing:', apiBase + '/tasks');
                 const response = await fetch(apiBase + '/tasks', {
-                    headers: { 'Authorization': 'Bearer ' + token }
+                    headers: { 
+                        'Authorization': 'Bearer ' + token,
+                        'Content-Type': 'application/json'
+                    }
                 });
                 const data = await response.json();
                 document.getElementById('test-results').innerHTML = 
-                    '<h5>/tasks Result:</h5><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                    '<h5>/tasks Result (' + response.status + '):</h5><pre>' + JSON.stringify(data, null, 2) + '</pre>';
             } catch (error) {
+                console.error('Test error:', error);
                 document.getElementById('test-results').innerHTML = 
                     '<h5>Error:</h5><pre>' + error.message + '</pre>';
             }
@@ -194,7 +219,7 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
     </script>
 </body>
 </html>
-    `, userSession.Name, userSession.Email, userSession.UserID, jwtToken, jwtToken, jwtToken, c.Request.Host, jwtToken, c.Request.Host)
+    `, userSession.Name, userSession.Email, userSession.UserID, jwtToken, apiBase, jwtToken, jwtToken, apiBase, jwtToken, apiBase, jwtToken, apiBase)
 
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(successHTML))
 }
