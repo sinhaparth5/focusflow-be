@@ -1,237 +1,602 @@
 package services
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
+	"context"
+	"log"
+	"os"
 	"time"
+
+	"cloud.google.com/go/firestore"
+	firebase "firebase.google.com/go/v4"
+	"google.golang.org/api/option"
 
 	"focusflow-be/internal/config"
 	"focusflow-be/internal/models"
 )
 
 type FirebaseService struct {
-	projectID string
-	apiKey    string
-	baseURL   string
+	client *firestore.Client
+	ctx    context.Context
 }
 
 func NewFirebaseService(cfg *config.Config) (*FirebaseService, error) {
-	if cfg.FirebaseProjectID == "" || cfg.FirebaseAPIKey == "" {
-		return nil, fmt.Errorf("Firebase project ID and API key are required")
-	}
+	ctx := context.Background()
 
-	return &FirebaseService{
-		projectID: cfg.FirebaseProjectID,
-		apiKey:    cfg.FirebaseAPIKey,
-		baseURL:   fmt.Sprintf("https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents", cfg.FirebaseProjectID),
-	}, nil
-}
+	var app *firebase.App
+	var err error
 
-func (s *FirebaseService) Close() error {
-	// No connection to close with REST API
-	return nil
-}
-
-// Helper function to make HTTP requests to Firestore REST API
-func (s *FirebaseService) makeRequest(method, path string, body interface{}) (*http.Response, error) {
-	url := fmt.Sprintf("%s%s?key=%s", s.baseURL, path, s.apiKey)
+	// Try different authentication methods
+	serviceAccountPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
 	
-	var reqBody io.Reader
-	if body != nil {
-		jsonBody, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		reqBody = bytes.NewBuffer(jsonBody)
+	if serviceAccountPath != "" && fileExists(serviceAccountPath) {
+		// Use service account key if available
+		log.Printf("Using service account key: %s", serviceAccountPath)
+		opt := option.WithCredentialsFile(serviceAccountPath)
+		app, err = firebase.NewApp(ctx, &firebase.Config{
+			ProjectID: cfg.FirebaseProjectID,
+		}, opt)
+	} else {
+		// Use Application Default Credentials (works with gcloud auth)
+		log.Printf("Using Application Default Credentials for project: %s", cfg.FirebaseProjectID)
+		app, err = firebase.NewApp(ctx, &firebase.Config{
+			ProjectID: cfg.FirebaseProjectID,
+		})
 	}
 
-	req, err := http.NewRequest(method, url, reqBody)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	
-	client := &http.Client{Timeout: 30 * time.Second}
-	return client.Do(req)
+	client, err := app.Firestore(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("✅ Firebase Firestore initialized successfully")
+	return &FirebaseService{
+		client: client,
+		ctx:    ctx,
+	}, nil
 }
 
-// Convert Firestore document format to our models
-func (s *FirebaseService) parseFirestoreDoc(doc map[string]interface{}) map[string]interface{} {
-	result := make(map[string]interface{})
-	
-	if fields, ok := doc["fields"].(map[string]interface{}); ok {
-		for key, value := range fields {
-			if valueMap, ok := value.(map[string]interface{}); ok {
-				// Extract the actual value based on Firestore type
-				if stringValue, ok := valueMap["stringValue"]; ok {
-					result[key] = stringValue
-				} else if boolValue, ok := valueMap["booleanValue"]; ok {
-					result[key] = boolValue
-				} else if timestampValue, ok := valueMap["timestampValue"]; ok {
-					if t, err := time.Parse(time.RFC3339, timestampValue.(string)); err == nil {
-						result[key] = t
-					}
-				}
-				// Add more type conversions as needed
-			}
-		}
-	}
-	
-	return result
+func fileExists(filename string) bool {
+	_, err := os.Stat(filename)
+	return !os.IsNotExist(err)
+}
+
+func (s *FirebaseService) Close() error {
+	return s.client.Close()
 }
 
 // User operations
 func (s *FirebaseService) CreateUser(user *models.UserSession) error {
-	// Convert user to Firestore format
-	firestoreDoc := map[string]interface{}{
-		"fields": map[string]interface{}{
-			"userId":       map[string]interface{}{"stringValue": user.UserID},
-			"email":        map[string]interface{}{"stringValue": user.Email},
-			"name":         map[string]interface{}{"stringValue": user.Name},
-			"accessToken":  map[string]interface{}{"stringValue": user.AccessToken},
-			"createdAt":    map[string]interface{}{"timestampValue": user.CreatedAt.Format(time.RFC3339)},
-			"lastLogin":    map[string]interface{}{"timestampValue": user.LastLogin.Format(time.RFC3339)},
-		},
-	}
-
-	resp, err := s.makeRequest("POST", "/users", firestoreDoc)
+	_, err := s.client.Collection("users").Doc(user.UserID).Set(s.ctx, user)
 	if err != nil {
+		log.Printf("Error creating user: %v", err)
 		return err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to create user: %s", body)
-	}
-
+	log.Printf("✅ User created: %s", user.Email)
 	return nil
 }
 
 func (s *FirebaseService) GetUser(userID string) (*models.UserSession, error) {
-	resp, err := s.makeRequest("GET", fmt.Sprintf("/users/%s", userID), nil)
+	doc, err := s.client.Collection("users").Doc(userID).Get(s.ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("user not found")
-	}
-
-	var doc map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+	var user models.UserSession
+	if err := doc.DataTo(&user); err != nil {
 		return nil, err
 	}
 
-	fields := s.parseFirestoreDoc(doc)
-	
-	user := &models.UserSession{
-		UserID:      fields["userId"].(string),
-		Email:       fields["email"].(string),
-		Name:        fields["name"].(string),
-		AccessToken: fields["accessToken"].(string),
-	}
-
-	if createdAt, ok := fields["createdAt"].(time.Time); ok {
-		user.CreatedAt = createdAt
-	}
-	if lastLogin, ok := fields["lastLogin"].(time.Time); ok {
-		user.LastLogin = lastLogin
-	}
-
-	return user, nil
+	return &user, nil
 }
 
 func (s *FirebaseService) UpdateUser(userID string, updates map[string]interface{}) error {
-	// Convert updates to Firestore format
-	firestoreUpdates := map[string]interface{}{
-		"fields": make(map[string]interface{}),
-	}
+	updates["lastLogin"] = time.Now()
 	
-	fields := firestoreUpdates["fields"].(map[string]interface{})
+	var firebaseUpdates []firestore.Update
 	for key, value := range updates {
-		switch v := value.(type) {
-		case string:
-			fields[key] = map[string]interface{}{"stringValue": v}
-		case time.Time:
-			fields[key] = map[string]interface{}{"timestampValue": v.Format(time.RFC3339)}
-		case bool:
-			fields[key] = map[string]interface{}{"booleanValue": v}
-		}
+		firebaseUpdates = append(firebaseUpdates, firestore.Update{
+			Path:  key,
+			Value: value,
+		})
 	}
 
-	resp, err := s.makeRequest("PATCH", fmt.Sprintf("/users/%s", userID), firestoreUpdates)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to update user: %s", body)
-	}
-
-	return nil
+	_, err := s.client.Collection("users").Doc(userID).Update(s.ctx, firebaseUpdates)
+	return err
 }
 
-// Simplified task operations (you would implement similar patterns for all CRUD operations)
+// Task operations
 func (s *FirebaseService) CreateTask(task *models.Task) (string, error) {
-	// Implementation similar to CreateUser but for tasks
-	// This is a simplified version - you'd need to implement full Firestore format conversion
-	return "", fmt.Errorf("not implemented - use the simplified version above as a template")
+	task.CreatedAt = time.Now()
+	task.UpdatedAt = time.Now()
+	
+	docRef, _, err := s.client.Collection("tasks").Add(s.ctx, task)
+	if err != nil {
+		log.Printf("Error creating task: %v", err)
+		return "", err
+	}
+	
+	log.Printf("✅ Task created: %s (ID: %s)", task.Title, docRef.ID)
+	return docRef.ID, nil
 }
 
 func (s *FirebaseService) GetTasks(userID string) ([]*models.Task, error) {
-	// Implementation for getting tasks using REST API
-	return nil, fmt.Errorf("not implemented - use the simplified version above as a template")
+	log.Printf("🔍 Fetching tasks for user: %s", userID)
+	
+	iter := s.client.Collection("tasks").Where("userId", "==", userID).Documents(s.ctx)
+	defer iter.Stop()
+
+	var tasks []*models.Task
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var task models.Task
+		if err := doc.DataTo(&task); err != nil {
+			log.Printf("Error parsing task document: %v", err)
+			continue
+		}
+		task.ID = doc.Ref.ID
+		tasks = append(tasks, &task)
+	}
+
+	log.Printf("✅ Found %d tasks for user %s", len(tasks), userID)
+	return tasks, nil
 }
 
-// Add other required methods with similar implementations...
 func (s *FirebaseService) UpdateTask(taskID string, updates map[string]interface{}) error {
-	return fmt.Errorf("not implemented")
+	updates["updatedAt"] = time.Now()
+	
+	var firebaseUpdates []firestore.Update
+	for key, value := range updates {
+		firebaseUpdates = append(firebaseUpdates, firestore.Update{
+			Path:  key,
+			Value: value,
+		})
+	}
+
+	_, err := s.client.Collection("tasks").Doc(taskID).Update(s.ctx, firebaseUpdates)
+	if err != nil {
+		log.Printf("Error updating task %s: %v", taskID, err)
+	}
+	return err
 }
 
 func (s *FirebaseService) DeleteTask(taskID string) error {
-	return fmt.Errorf("not implemented")
+	_, err := s.client.Collection("tasks").Doc(taskID).Delete(s.ctx)
+	if err != nil {
+		log.Printf("Error deleting task %s: %v", taskID, err)
+	}
+	return err
 }
 
+// Meeting operations
 func (s *FirebaseService) CreateMeeting(meeting *models.Meeting) (string, error) {
-	return "", fmt.Errorf("not implemented")
+	meeting.CreatedAt = time.Now()
+	
+	docRef, _, err := s.client.Collection("meetings").Add(s.ctx, meeting)
+	if err != nil {
+		log.Printf("Error creating meeting: %v", err)
+		return "", err
+	}
+	
+	log.Printf("✅ Meeting created: %s (ID: %s)", meeting.Title, docRef.ID)
+	return docRef.ID, nil
 }
 
 func (s *FirebaseService) GetMeetings(userID string) ([]*models.Meeting, error) {
-	return nil, fmt.Errorf("not implemented")
+	log.Printf("🔍 Fetching meetings for user: %s", userID)
+	
+	iter := s.client.Collection("meetings").Where("userId", "==", userID).Documents(s.ctx)
+	defer iter.Stop()
+
+	var meetings []*models.Meeting
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var meeting models.Meeting
+		if err := doc.DataTo(&meeting); err != nil {
+			log.Printf("Error parsing meeting document: %v", err)
+			continue
+		}
+		meeting.ID = doc.Ref.ID
+		meetings = append(meetings, &meeting)
+	}
+
+	log.Printf("✅ Found %d meetings for user %s", len(meetings), userID)
+	return meetings, nil
 }
 
 func (s *FirebaseService) UpdateMeeting(meetingID string, updates map[string]interface{}) error {
-	return fmt.Errorf("not implemented")
+	var firebaseUpdates []firestore.Update
+	for key, value := range updates {
+		firebaseUpdates = append(firebaseUpdates, firestore.Update{
+			Path:  key,
+			Value: value,
+		})
+	}
+
+	_, err := s.client.Collection("meetings").Doc(meetingID).Update(s.ctx, firebaseUpdates)
+	if err != nil {
+		log.Printf("Error updating meeting %s: %v", meetingID, err)
+	}
+	return err
 }
 
+// Reminder operations
 func (s *FirebaseService) CreateReminder(reminder *models.Reminder) (string, error) {
-	return "", fmt.Errorf("not implemented")
+	reminder.CreatedAt = time.Now()
+	
+	docRef, _, err := s.client.Collection("reminders").Add(s.ctx, reminder)
+	if err != nil {
+		log.Printf("Error creating reminder: %v", err)
+		return "", err
+	}
+	
+	log.Printf("✅ Reminder created: %s (ID: %s)", reminder.Title, docRef.ID)
+	return docRef.ID, nil
 }
 
 func (s *FirebaseService) GetReminders(userID string) ([]*models.Reminder, error) {
-	return nil, fmt.Errorf("not implemented")
+	log.Printf("🔍 Fetching reminders for user: %s", userID)
+	
+	iter := s.client.Collection("reminders").Where("userId", "==", userID).Documents(s.ctx)
+	defer iter.Stop()
+
+	var reminders []*models.Reminder
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var reminder models.Reminder
+		if err := doc.DataTo(&reminder); err != nil {
+			log.Printf("Error parsing reminder document: %v", err)
+			continue
+		}
+		reminder.ID = doc.Ref.ID
+		reminders = append(reminders, &reminder)
+	}
+
+	log.Printf("✅ Found %d reminders for user %s", len(reminders), userID)
+	return reminders, nil
 }
 
 func (s *FirebaseService) UpdateReminder(reminderID string, updates map[string]interface{}) error {
-	return fmt.Errorf("not implemented")
+	var firebaseUpdates []firestore.Update
+	for key, value := range updates {
+		firebaseUpdates = append(firebaseUpdates, firestore.Update{
+			Path:  key,
+			Value: value,
+		})
+	}
+
+	_, err := s.client.Collection("reminders").Doc(reminderID).Update(s.ctx, firebaseUpdates)
+	if err != nil {
+		log.Printf("Error updating reminder %s: %v", reminderID, err)
+	}
+	return err
 }
 
+// Dashboard operations
 func (s *FirebaseService) GetAllTasks() ([]*models.Task, error) {
-	return nil, fmt.Errorf("not implemented")
+	iter := s.client.Collection("tasks").Documents(s.ctx)
+	defer iter.Stop()
+
+	var tasks []*models.Task
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var task models.Task
+		if err := doc.DataTo(&task); err != nil {
+			continue
+		}
+		task.ID = doc.Ref.ID
+		tasks = append(tasks, &task)
+	}
+
+	return tasks, nil
 }
 
 func (s *FirebaseService) GetAllMeetings() ([]*models.Meeting, error) {
-	return nil, fmt.Errorf("not implemented")
+	iter := s.client.Collection("meetings").Documents(s.ctx)
+	defer iter.Stop()
+
+	var meetings []*models.Meeting
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var meeting models.Meeting
+		if err := doc.DataTo(&meeting); err != nil {
+			continue
+		}
+		meeting.ID = doc.Ref.ID
+		meetings = append(meetings, &meeting)
+	}
+
+	return meetings, nil
 }
 
 func (s *FirebaseService) GetAllReminders() ([]*models.Reminder, error) {
-	return nil, fmt.Errorf("not implemented")
+	iter := s.client.Collection("reminders").Documents(s.ctx)
+	defer iter.Stop()
+
+	var reminders []*models.Reminder
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var reminder models.Reminder
+		if err := doc.DataTo(&reminder); err != nil {
+			continue
+		}
+		reminder.ID = doc.Ref.ID
+		reminders = append(reminders, &reminder)
+	}
+
+	return reminders, nil
+}
+
+func (s *FirebaseService) Close() error {
+	return s.client.Close()
+}
+
+// User operations
+func (s *FirebaseService) CreateUser(user *models.UserSession) error {
+	_, err := s.client.Collection("users").Doc(user.UserID).Set(s.ctx, user)
+	return err
+}
+
+func (s *FirebaseService) GetUser(userID string) (*models.UserSession, error) {
+	doc, err := s.client.Collection("users").Doc(userID).Get(s.ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var user models.UserSession
+	if err := doc.DataTo(&user); err != nil {
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+func (s *FirebaseService) UpdateUser(userID string, updates map[string]interface{}) error {
+	updates["lastLogin"] = time.Now()
+	_, err := s.client.Collection("users").Doc(userID).Update(s.ctx, []firestore.Update{
+		{Path: "accessToken", Value: updates["accessToken"]},
+		{Path: "refreshToken", Value: updates["refreshToken"]},
+		{Path: "lastLogin", Value: updates["lastLogin"]},
+	})
+	return err
+}
+
+// Task operations
+func (s *FirebaseService) CreateTask(task *models.Task) (string, error) {
+	task.CreatedAt = time.Now()
+	task.UpdatedAt = time.Now()
+	
+	docRef, _, err := s.client.Collection("tasks").Add(s.ctx, task)
+	if err != nil {
+		return "", err
+	}
+	return docRef.ID, nil
+}
+
+func (s *FirebaseService) GetTasks(userID string) ([]*models.Task, error) {
+	iter := s.client.Collection("tasks").Where("userId", "==", userID).Documents(s.ctx)
+	defer iter.Stop()
+
+	var tasks []*models.Task
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var task models.Task
+		if err := doc.DataTo(&task); err != nil {
+			continue
+		}
+		task.ID = doc.Ref.ID
+		tasks = append(tasks, &task)
+	}
+
+	return tasks, nil
+}
+
+func (s *FirebaseService) UpdateTask(taskID string, updates map[string]interface{}) error {
+	updates["updatedAt"] = time.Now()
+	
+	var firebaseUpdates []firestore.Update
+	for key, value := range updates {
+		firebaseUpdates = append(firebaseUpdates, firestore.Update{
+			Path:  key,
+			Value: value,
+		})
+	}
+
+	_, err := s.client.Collection("tasks").Doc(taskID).Update(s.ctx, firebaseUpdates)
+	return err
+}
+
+func (s *FirebaseService) DeleteTask(taskID string) error {
+	_, err := s.client.Collection("tasks").Doc(taskID).Delete(s.ctx)
+	return err
+}
+
+// Meeting operations
+func (s *FirebaseService) CreateMeeting(meeting *models.Meeting) (string, error) {
+	meeting.CreatedAt = time.Now()
+	
+	docRef, _, err := s.client.Collection("meetings").Add(s.ctx, meeting)
+	if err != nil {
+		return "", err
+	}
+	return docRef.ID, nil
+}
+
+func (s *FirebaseService) GetMeetings(userID string) ([]*models.Meeting, error) {
+	iter := s.client.Collection("meetings").Where("userId", "==", userID).Documents(s.ctx)
+	defer iter.Stop()
+
+	var meetings []*models.Meeting
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var meeting models.Meeting
+		if err := doc.DataTo(&meeting); err != nil {
+			continue
+		}
+		meeting.ID = doc.Ref.ID
+		meetings = append(meetings, &meeting)
+	}
+
+	return meetings, nil
+}
+
+func (s *FirebaseService) UpdateMeeting(meetingID string, updates map[string]interface{}) error {
+	var firebaseUpdates []firestore.Update
+	for key, value := range updates {
+		firebaseUpdates = append(firebaseUpdates, firestore.Update{
+			Path:  key,
+			Value: value,
+		})
+	}
+
+	_, err := s.client.Collection("meetings").Doc(meetingID).Update(s.ctx, firebaseUpdates)
+	return err
+}
+
+// Reminder operations
+func (s *FirebaseService) CreateReminder(reminder *models.Reminder) (string, error) {
+	reminder.CreatedAt = time.Now()
+	
+	docRef, _, err := s.client.Collection("reminders").Add(s.ctx, reminder)
+	if err != nil {
+		return "", err
+	}
+	return docRef.ID, nil
+}
+
+func (s *FirebaseService) GetReminders(userID string) ([]*models.Reminder, error) {
+	iter := s.client.Collection("reminders").Where("userId", "==", userID).Documents(s.ctx)
+	defer iter.Stop()
+
+	var reminders []*models.Reminder
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var reminder models.Reminder
+		if err := doc.DataTo(&reminder); err != nil {
+			continue
+		}
+		reminder.ID = doc.Ref.ID
+		reminders = append(reminders, &reminder)
+	}
+
+	return reminders, nil
+}
+
+func (s *FirebaseService) UpdateReminder(reminderID string, updates map[string]interface{}) error {
+	var firebaseUpdates []firestore.Update
+	for key, value := range updates {
+		firebaseUpdates = append(firebaseUpdates, firestore.Update{
+			Path:  key,
+			Value: value,
+		})
+	}
+
+	_, err := s.client.Collection("reminders").Doc(reminderID).Update(s.ctx, firebaseUpdates)
+	return err
+}
+
+// Dashboard operations
+func (s *FirebaseService) GetAllTasks() ([]*models.Task, error) {
+	iter := s.client.Collection("tasks").Documents(s.ctx)
+	defer iter.Stop()
+
+	var tasks []*models.Task
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var task models.Task
+		if err := doc.DataTo(&task); err != nil {
+			continue
+		}
+		task.ID = doc.Ref.ID
+		tasks = append(tasks, &task)
+	}
+
+	return tasks, nil
+}
+
+func (s *FirebaseService) GetAllMeetings() ([]*models.Meeting, error) {
+	iter := s.client.Collection("meetings").Documents(s.ctx)
+	defer iter.Stop()
+
+	var meetings []*models.Meeting
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var meeting models.Meeting
+		if err := doc.DataTo(&meeting); err != nil {
+			continue
+		}
+		meeting.ID = doc.Ref.ID
+		meetings = append(meetings, &meeting)
+	}
+
+	return meetings, nil
+}
+
+func (s *FirebaseService) GetAllReminders() ([]*models.Reminder, error) {
+	iter := s.client.Collection("reminders").Documents(s.ctx)
+	defer iter.Stop()
+
+	var reminders []*models.Reminder
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		var reminder models.Reminder
+		if err := doc.DataTo(&reminder); err != nil {
+			continue
+		}
+		reminder.ID = doc.Ref.ID
+		reminders = append(reminders, &reminder)
+	}
+
+	return reminders, nil
 }
